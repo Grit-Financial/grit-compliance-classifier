@@ -19,7 +19,9 @@ const CONFIG = Object.freeze({
   RULE_VERSION: '2026.10-apps-script.1',
   REVIEW_THRESHOLD: 80,
   UNKNOWN_THRESHOLD: 50,
-  MAX_ROWS: 5000
+  MAX_ROWS_PER_TAB: 5000,
+  MAX_TOTAL_ROWS: 15000,
+  MAX_FILES_PER_REQUEST: 10
 });
 
 const REGULATIONS = Object.freeze({
@@ -130,7 +132,7 @@ function doGet(e) {
   if (action === 'analyze') {
     try {
       const sheetUrl = p.sheet_url || p.sheetUrl || '';
-      const result = analyzeSheet_(sheetUrl);
+      const result = analyzeWorkbook_(sheetUrl);
       return respond_(result, p.callback);
     } catch (err) {
       return respond_({status:'error', error: err.message || String(err)}, p.callback);
@@ -158,67 +160,168 @@ function doPost(e) {
       throw new Error('Unsupported action.');
     }
 
+    const sheetUrls = body.sheet_urls || body.sheetUrls || [];
+    if (Array.isArray(sheetUrls) && sheetUrls.length) {
+      return respond_(analyzeFiles_(sheetUrls));
+    }
+
     const sheetUrl = body.sheet_url || body.sheetUrl || '';
-    return respond_(analyzeSheet_(sheetUrl));
+    return respond_(analyzeWorkbook_(sheetUrl));
   } catch (err) {
     return respond_({status:'error', error: err.message || String(err)});
   }
 }
 
-function analyzeSheet_(sheetUrl) {
+function analyzeFiles_(sheetUrls) {
+  const urls = unique_(
+    (sheetUrls || [])
+      .map(v => String(v || '').trim())
+      .filter(Boolean)
+  );
+
+  if (!urls.length) throw new Error('At least one Google Sheets URL is required.');
+  if (urls.length > CONFIG.MAX_FILES_PER_REQUEST) {
+    throw new Error('A maximum of ' + CONFIG.MAX_FILES_PER_REQUEST + ' Google Sheets files can be analyzed in one request.');
+  }
+
+  const files = [];
+  const results = [];
+  const errors = [];
+
+  urls.forEach(url => {
+    try {
+      const fileResult = analyzeWorkbook_(url);
+      files.push({
+        spreadsheet_name: fileResult.spreadsheet_name,
+        spreadsheet_id: fileResult.spreadsheet_id,
+        tabs_analyzed: fileResult.tabs_analyzed,
+        tabs_skipped: fileResult.tabs_skipped,
+        rows_classified: fileResult.rows_classified
+      });
+      Array.prototype.push.apply(results, fileResult.results);
+    } catch (err) {
+      errors.push({sheet_url:url, error:err.message || String(err)});
+    }
+  });
+
+  if (!results.length && errors.length) {
+    throw new Error('No files could be analyzed. ' + errors.map(e => e.error).join(' | '));
+  }
+
+  return {
+    status: errors.length ? 'partial_success' : 'success',
+    files_requested: urls.length,
+    files_analyzed: files.length,
+    files_failed: errors.length,
+    tabs_analyzed: files.reduce((n, f) => n + Number(f.tabs_analyzed || 0), 0),
+    rows_classified: results.length,
+    file_results: files,
+    errors: errors,
+    rule_version: CONFIG.RULE_VERSION,
+    generated_at: new Date().toISOString(),
+    summary: summarize_(results),
+    results: results
+  };
+}
+
+function analyzeWorkbook_(sheetUrl) {
   if (!sheetUrl) {
     throw new Error('A Google Sheets URL is required.');
   }
 
   const parsed = parseSheetUrl_(sheetUrl);
   const ss = SpreadsheetApp.openById(parsed.spreadsheetId);
-  const sheet = parsed.gid !== null ? getSheetByGid_(ss, parsed.gid) : ss.getSheets()[0];
-
-  if (!sheet) {
-    throw new Error('Unable to locate the requested sheet tab.');
-  }
-
-  const values = sheet.getDataRange().getDisplayValues();
-  if (!values || values.length < 2) {
-    throw new Error('The selected sheet has no complaint rows to analyze.');
-  }
-
-  const headers = values[0].map(v => String(v || '').trim());
-  const mapping = inferColumns_(headers);
-
-  if (mapping.complaint === -1) {
-    throw new Error('Could not find a complaint, reason, description, narrative, or issue column.');
-  }
-
-  const rowLimit = Math.min(values.length - 1, CONFIG.MAX_ROWS);
+  const sheets = ss.getSheets();
   const results = [];
+  const analyzedTabs = [];
+  const skippedTabs = [];
+  let totalRowsScanned = 0;
 
-  for (let i = 1; i <= rowLimit; i++) {
-    const row = values[i];
-    if (isBlankRow_(row)) continue;
+  for (let s = 0; s < sheets.length; s++) {
+    const sheet = sheets[s];
 
-    const rec = {
-      row_number: i + 1,
-      case_id: valueAt_(row, mapping.case_id) || 'ROW-' + (i + 1),
-      customer: valueAt_(row, mapping.customer),
-      date: valueAt_(row, mapping.date),
-      program_product: valueAt_(row, mapping.program),
-      source_channel: valueAt_(row, mapping.source),
-      complaint: valueAt_(row, mapping.complaint),
-      resolution: valueAt_(row, mapping.resolution),
-      source_sheet: sheet.getName(),
-      source_spreadsheet: ss.getName()
-    };
+    if (totalRowsScanned >= CONFIG.MAX_TOTAL_ROWS) {
+      skippedTabs.push({
+        sheet_name: sheet.getName(),
+        reason: 'Workbook row limit reached'
+      });
+      continue;
+    }
 
-    if (!rec.complaint && !rec.resolution) continue;
-    results.push(classifyComplaint_(rec));
+    const values = sheet.getDataRange().getDisplayValues();
+
+    if (!values || values.length < 2) {
+      skippedTabs.push({
+        sheet_name: sheet.getName(),
+        reason: 'No data rows'
+      });
+      continue;
+    }
+
+    const headers = values[0].map(v => String(v || '').trim());
+    const mapping = inferColumns_(headers);
+
+    if (mapping.complaint === -1) {
+      skippedTabs.push({
+        sheet_name: sheet.getName(),
+        reason: 'No recognizable complaint/reason/description/narrative/issue column'
+      });
+      continue;
+    }
+
+    const availableRows = values.length - 1;
+    const remainingRows = CONFIG.MAX_TOTAL_ROWS - totalRowsScanned;
+    const rowLimit = Math.min(availableRows, CONFIG.MAX_ROWS_PER_TAB, remainingRows);
+    let classifiedOnTab = 0;
+
+    for (let i = 1; i <= rowLimit; i++) {
+      const row = values[i];
+      if (isBlankRow_(row)) continue;
+
+      const rec = {
+        row_number: i + 1,
+        case_id: valueAt_(row, mapping.case_id) || sheet.getName() + '-ROW-' + (i + 1),
+        customer: valueAt_(row, mapping.customer),
+        date: valueAt_(row, mapping.date),
+        program_product: valueAt_(row, mapping.program),
+        source_channel: valueAt_(row, mapping.source),
+        complaint: valueAt_(row, mapping.complaint),
+        resolution: valueAt_(row, mapping.resolution),
+        source_sheet: sheet.getName(),
+        source_spreadsheet: ss.getName(),
+        source_spreadsheet_id: ss.getId()
+      };
+
+      if (!rec.complaint && !rec.resolution) continue;
+      results.push(classifyComplaint_(rec));
+      classifiedOnTab++;
+    }
+
+    totalRowsScanned += rowLimit;
+    analyzedTabs.push({
+      sheet_name: sheet.getName(),
+      rows_scanned: rowLimit,
+      rows_classified: classifiedOnTab
+    });
+  }
+
+  if (!results.length) {
+    const details = skippedTabs.length
+      ? ' Tabs skipped: ' + skippedTabs.map(t => t.sheet_name + ' (' + t.reason + ')').join('; ')
+      : '';
+    throw new Error('No complaint rows were found in any tab of this Google Sheet.' + details);
   }
 
   return {
     status: 'success',
     spreadsheet_name: ss.getName(),
-    sheet_name: sheet.getName(),
-    rows_scanned: rowLimit,
+    spreadsheet_id: ss.getId(),
+    tabs_total: sheets.length,
+    tabs_analyzed: analyzedTabs.length,
+    tabs_skipped: skippedTabs.length,
+    analyzed_tabs: analyzedTabs,
+    skipped_tabs: skippedTabs,
+    rows_scanned: totalRowsScanned,
     rows_classified: results.length,
     rule_version: CONFIG.RULE_VERSION,
     generated_at: new Date().toISOString(),
@@ -398,13 +501,13 @@ function inferColumns_(headers) {
   }
 
   return {
-    complaint: pick(['complaint','reason','description','narrative','issue']),
-    resolution: pick(['resolution','response','outcome','action taken']),
-    case_id: pick(['case id','ticket','complaint id','ticket id']),
-    date: pick(['complaint date','date','created']),
-    customer: pick(['customer','customer name','employee name','name']),
-    program: pick(['program','product','client']),
-    source: pick(['source','channel','method'])
+    complaint: pick(['complaint reason','complaint','reason','description','narrative','issue']),
+    resolution: pick(['resolution provided','resolution','response','outcome','action taken']),
+    case_id: pick(['complainant identifier','complainant id','case id','ticket','complaint id','ticket id']),
+    date: pick(['date complaint received','complaint date','date','created']),
+    customer: pick(['name of complainant','complainant name','customer name','employee name','customer','name']),
+    program: pick(['program name','program','complaint product','product','client']),
+    source: pick(['method complaint received','source','channel','method'])
   };
 }
 
