@@ -28,6 +28,12 @@ For the GitHub Pages UI, analysis uses JSONP:
 
 `?action=analyze&sheet_url=<encoded Google Sheet URL>&callback=<callback>`
 
+Each Google Sheets URL is treated as a **workbook**. The backend scans every tab in that workbook and analyzes each tab that contains a recognizable complaint column. Empty tabs and non-complaint tabs are skipped and reported in metadata.
+
+The frontend accepts up to **10 Google Sheets files at once**, one URL per line. It analyzes each workbook and combines the results into one dashboard and one Excel export.
+
+The POST endpoint also accepts `sheet_urls` as an array for multi-file processing.
+
 This avoids cross-origin browser restrictions between GitHub Pages and Apps Script.
 
 ## Input sheet
@@ -49,3 +55,12 @@ The backend automatically looks for these column concepts:
 - **Below 50%:** Unknown / Insufficient Evidence + Human Review
 
 The output is preliminary compliance triage. Final determinations remain subject to human Compliance or Legal review.
+
+
+## Workbook and multi-file limits
+
+- Up to 5,000 rows per tab
+- Up to 15,000 rows per workbook
+- Up to 10 Google Sheets files in a multi-file request
+- All tabs are scanned; only tabs with a recognizable complaint column are classified
+- Source spreadsheet and source tab are retained on every result row
